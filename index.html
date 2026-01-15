@@ -1,0 +1,295 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>AppForge App</title>
+    <style>
+        body { font-family: sans-serif; background: #1e1e1e; color: #fff; padding: 20px; }
+        #output { background: #000; padding: 10px; border-radius: 5px; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <h1>AppForge Generated App</h1>
+    <div id="app"></div>
+    <script>
+        // Injected AI Script
+        try {
+            /**
+ * appforge_builder.js
+ * Single script to generate the full AppForge Electron application source tree.
+ * Run with: node appforge_builder.js
+ */
+
+const fs = require("fs");
+const path = require("path");
+
+const files = {
+  "package.json": `
+{
+  "name": "appforge",
+  "version": "1.0.0",
+  "description": "AppForge - Build EXE via GitHub Actions",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "axios": "^1.6.7",
+    "fs-extra": "^11.2.0",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0"
+  }
+}
+`.trim(),
+
+  "main.js": `
+const { app, BrowserWindow, ipcMain } = require('electron');
+const path = require('path');
+const axios = require('axios');
+const fs = require('fs-extra');
+
+let win;
+
+function createWindow() {
+  win = new BrowserWindow({
+    width: 1300,
+    height: 800,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js')
+    }
+  });
+  win.loadFile('index.html');
+}
+
+app.whenReady().then(createWindow);
+
+ipcMain.handle('build', async (event, data) => {
+  const { token, repo, script } = data;
+  try {
+    const [user, repoName] = repo.split('/');
+    const headers = {
+      Authorization: \`Bearer \${token}\`,
+      "User-Agent": "AppForge",
+      Accept: "application/vnd.github+json"
+    };
+
+    await log("Creating repo...");
+    try {
+      await axios.post("https://api.github.com/user/repos", {
+        name: repoName,
+        private: false
+      }, { headers });
+    } catch (e) {}
+
+    await log("Committing files...");
+    await commitFiles(user, repoName, headers, script);
+
+    await log("Triggering workflow...");
+    await axios.post(\`https://api.github.com/repos/\${user}/\${repoName}/actions/workflows/build.yml/dispatches\`, {
+      ref: "main"
+    }, { headers });
+
+    await log("Polling build...");
+    const url = await pollArtifact(headers, user, repoName);
+    return { status: "success", url };
+  } catch (e) {
+    return { status: "failed" };
+  }
+});
+
+async function commitFiles(user, repo, headers, script) {
+  const api = "https://api.github.com";
+  const get = p => axios.get(\`\${api}\${p}\`, { headers });
+  const post = (p,d) => axios.post(\`\${api}\${p}\`, d, { headers });
+  const patch = (p,d) => axios.patch(\`\${api}\${p}\`, d, { headers });
+
+  let baseSha = null;
+  try {
+    const r = await get(\`/repos/\${user}/\${repo}/git/ref/heads/main\`);
+    const commit = await get(\`/repos/\${user}/\${repo}/git/commits/\${r.data.object.sha}\`);
+    baseSha = commit.data.tree.sha;
+  } catch {}
+
+  const inputFiles = {
+    "package.json": \`${files["package.json"]}\`,
+    "main.js": \`${files["main.js"]}\`,
+    "preload.js": \`${files["preload.js"]}\`,
+    "renderer.js": \`${files["renderer.js"]}\`,
+    "index.html": \`${files["index.html"]}\`,
+    "style.css": \`${files["style.css"]}\`,
+    ".github/workflows/build.yml": \`${files[".github/workflows/build.yml"]}\`,
+    "builder.js": script.trim()
+  };
+
+  const tree = [];
+  for (const p in inputFiles) {
+    const blob = await post(\`/repos/\${user}/\${repo}/git/blobs\`, {
+      content: inputFiles[p],
+      encoding: "utf-8"
+    });
+    tree.push({ path: p, mode: "100644", type: "blob", sha: blob.data.sha });
+  }
+
+  const newTree = await post(\`/repos/\${user}/\${repo}/git/trees\`, {
+    base_tree: baseSha || undefined,
+    tree
+  });
+
+  const commit = await post(\`/repos/\${user}/\${repo}/git/commits\`, {
+    message: "AppForge auto commit",
+    tree: newTree.data.sha,
+    parents: baseSha ? [baseSha] : []
+  });
+
+  try {
+    await patch(\`/repos/\${user}/\${repo}/git/refs/heads/main\`, { sha: commit.data.sha, force: true });
+  } catch {
+    await post(\`/repos/\${user}/\${repo}/git/refs\`, {
+      ref: "refs/heads/main",
+      sha: commit.data.sha
+    });
+  }
+}
+
+async function pollArtifact(headers, user, repo) {
+  while (true) {
+    const runs = await axios.get(\`https://api.github.com/repos/\${user}/\${repo}/actions/runs\`, { headers });
+    const run = runs.data.workflow_runs[0];
+    if (run && run.status === "completed") {
+      if (run.conclusion === "success") {
+        const artifacts = await axios.get(run.artifacts_url, { headers });
+        if (artifacts.data.artifacts.length > 0) {
+          return artifacts.data.artifacts[0].archive_download_url;
+        }
+      }
+      throw Error();
+    }
+    await new Promise(r => setTimeout(r, 8000));
+  }
+}
+
+async function log(msg) {
+  if (win) win.webContents.send('log', msg);
+}
+`.trim(),
+
+  "preload.js": `
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('appforge', {
+  build: (data) => ipcRenderer.invoke('build', data),
+  onLog: (cb) => ipcRenderer.on('log', (_, m) => cb(m))
+});
+`.trim(),
+
+  "renderer.js": `
+const t = document.getElementById("token");
+const r = document.getElementById("repo");
+const s = document.getElementById("script");
+const b = document.getElementById("build");
+const o = document.getElementById("status");
+const l = document.getElementById("logs");
+
+window.appforge.onLog(m => l.value += m + "\\n");
+
+b.onclick = async () => {
+  o.innerText = "Building...";
+  const res = await window.appforge.build({
+    token: t.value.trim(),
+    repo: r.value.trim(),
+    script: s.value
+  });
+  if (res.status === "success") {
+    o.innerText = "Success";
+    l.value += "Download: " + res.url + "\\n";
+  } else {
+    o.innerText = "Failed";
+  }
+};
+`.trim(),
+
+  "index.html": `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>AppForge</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="container">
+  <div id="left">
+    <h2>AppForge</h2>
+    <textarea id="logs" readonly></textarea>
+  </div>
+  <div id="right">
+    <label>GitHub Token:</label>
+    <input id="token" type="text"/>
+    <label>username/repo:</label>
+    <input id="repo" type="text"/>
+    <label>Build Target:</label>
+    <select><option>Windows EXE</option></select>
+    <label>Script:</label>
+    <textarea id="script"></textarea>
+    <button id="build">Build Application</button>
+    <div id="status">Idle</div>
+  </div>
+</div>
+<script src="renderer.js"></script>
+</body>
+</html>
+`.trim(),
+
+  "style.css": `
+body {margin:0;background:#1e1e1e;color:#eee;font-family:Arial;}
+#container{display:flex;height:100vh}
+#left{width:40%;padding:10px;border-right:1px solid #333;display:flex;flex-direction:column}
+#right{width:60%;padding:10px;display:flex;flex-direction:column}
+textarea,input,select{width:100%;margin-bottom:10px;padding:8px;background:#2a2a2a;border:1px solid #444;color:#eee}
+button{padding:10px;background:#444;border:none;color:#fff;cursor:pointer}
+button:hover{background:#555}
+#status{margin-top:10px;padding:5px;background:#2a2a2a;text-align:center}
+#logs{flex:1;resize:none}
+`.trim(),
+
+  ".github/workflows/build.yml": `
+name: Build Electron EXE
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 18
+      - run: npm install --global electron electron-builder
+      - run: npm install
+      - run: electron-builder --win
+      - uses: actions/upload-artifact@v3
+        with:
+          name: exe-build
+          path: dist/*.exe
+`.trim()
+};
+
+function writeTree() {
+  const base = process.cwd();
+  for (const p in files) {
+    const full = path.join(base, p);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, files[p]);
+  }
+}
+
+writeTree();
+
+        } catch (e) {
+            document.body.innerHTML += '<div style="color:red">Runtime Error: ' + e.message + '</div>';
+        }
+    </script>
+</body>
+</html>
